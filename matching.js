@@ -1,4 +1,5 @@
 // matching.js
+import Decimal from 'decimal.js';
 
 /**
  * Pure in-memory order matching implementation.
@@ -9,33 +10,38 @@
  * @property {string} orderId
  * @property {'BUY'|'SELL'} side
  * @property {'LIMIT'|'MARKET'} type
- * @property {number} price    // Only for LIMIT orders
- * @property {number} qty
+ * @property {string} price    // Only for LIMIT orders
+ * @property {string} qty
+ * @property {string|number} [userId]
  *
  * @typedef {Object<string, Order[]>} BookSide
  * @typedef {Object} OrderBook
- * @property {BookSide} bids  // price -> list of buy orders
- * @property {BookSide} asks  // price -> list of sell orders
+ * @property {BookSide} bids  // price(string) -> list of buy orders
+ * @property {BookSide} asks  // price(string) -> list of sell orders
  */
 
 /**
- * Trade represents a matched transaction between a maker and taker.
+ * Trade represents a matched transaction between a maker and a taker.
+ * filled: this trade leaves the order fully completed (post-trade state).
+ *
  * @typedef {Object} MakerTakerInfo
  * @property {string} orderId
  * @property {'BUY'|'SELL'} side
+ * @property {string|number} [userId]
+ * @property {boolean} [filled]
  *
- * @typedef {Object} Trade
+ * @typedef {Object} TradeLike
  * @property {string} symbol
  * @property {MakerTakerInfo} maker
  * @property {MakerTakerInfo} taker
- * @property {number} price
- * @property {number} qty
+ * @property {string} price
+ * @property {string} qty
  * @property {number} timestamp
  */
 
 class Trade {
     /**
-     * @param {{ symbol: string, maker: MakerTakerInfo, taker: MakerTakerInfo, price: number, qty: number, timestamp: number }} args
+     * @param {{ symbol: string, maker: MakerTakerInfo, taker: MakerTakerInfo, price: string, qty: string, timestamp: number }} args
      */
     constructor({ symbol, maker, taker, price, qty, timestamp }) {
         if (!maker || !taker || price == null || qty == null || timestamp == null) {
@@ -64,8 +70,7 @@ setInterval(() => {
  * @returns {{ trades: Trade[], updatedBook: OrderBook }}
  */
 export function match(order, book) {
-
-    // Deep clone book
+    // Deep clone book (preserve string price keys)
     const updatedBook = { bids: {}, asks: {} };
     for (const [p, orders] of Object.entries(book.bids)) {
         updatedBook.bids[p] = orders.map(o => ({ ...o }));
@@ -75,70 +80,89 @@ export function match(order, book) {
     }
 
     const trades = [];
-    let remaining = order.qty;
+    const orderQtyDecimal = new Decimal(order.qty);
+    let remaining = orderQtyDecimal;
     const isBuy = order.side === 'BUY';
     const ownSide = isBuy ? 'bids' : 'asks';
     const oppositeSide = isBuy ? 'asks' : 'bids';
 
-    // Price levels sorted: BUY matches lowest asks first; SELL matches highest bids first
-    const levels = Object.keys(updatedBook[oppositeSide])
-        .map(Number)
-        .sort((a, b) => isBuy ? a - b : b - a);
+    // Keep keys as strings, sort by numeric value via Decimal
+    const levelKeys = Object.keys(updatedBook[oppositeSide]).sort((a, b) =>
+        isBuy ? new Decimal(a).cmp(new Decimal(b)) : new Decimal(b).cmp(new Decimal(a))
+    );
 
-    for (const priceLevel of levels) {
-        if (remaining <= 0) break;
-        // For LIMIT orders, enforce price constraint
+    for (const levelKey of levelKeys) {
+        if (remaining.lte(0)) break;
+
+        const priceLevelDec = new Decimal(levelKey);
+
+        // LIMIT price constraint with Decimal
         if (order.type === 'LIMIT') {
-            if ((isBuy && order.price < priceLevel) || (!isBuy && order.price > priceLevel)) {
-                break;
-            }
+            const orderPriceDec = new Decimal(order.price);
+            if (isBuy && orderPriceDec.lt(priceLevelDec)) break;
+            if (!isBuy && orderPriceDec.gt(priceLevelDec)) break;
         }
-        const queue = updatedBook[oppositeSide][priceLevel.toString()];
-        while (queue.length > 0 && remaining > 0) {
+
+        const queue = updatedBook[oppositeSide][levelKey];
+        if (!queue || queue.length === 0) {
+            delete updatedBook[oppositeSide][levelKey];
+            continue;
+        }
+
+        while (queue.length > 0 && remaining.gt(0)) {
             const maker = queue.shift();
-            const matchQty = Math.min(remaining, maker.qty);
+            const makerQtyDecimal = new Decimal(maker.qty);
+            const matchQty = Decimal.min(remaining, makerQtyDecimal);
+
+            const makerLeftover = makerQtyDecimal.minus(matchQty);
+            const makerFilledAfter = makerLeftover.eq(0);
+            const takerFilledAfter = remaining.minus(matchQty).eq(0);
 
             const trade = new Trade({
                 symbol: order.symbol,
                 maker: {
                     orderId: maker.orderId,
                     side: maker.side,
-                    userId: maker.userId
+                    userId: maker.userId,
+                    filled: makerFilledAfter,
                 },
                 taker: {
                     orderId: order.orderId,
                     side: order.side,
-                    userId: order.userId
+                    userId: order.userId,
+                    filled: takerFilledAfter,
                 },
-                price: priceLevel,
-                qty: matchQty,
+                price: levelKey,                // keep original string key (e.g., "114882.00")
+                qty: matchQty.toString(),
                 timestamp: Date.now(),
             });
             trades.push(trade);
 
-            remaining -= matchQty;
-            maker.qty -= matchQty;
-            if (maker.qty > 0) {
+            remaining = remaining.minus(matchQty);
+
+            if (makerLeftover.gt(0)) {
+                maker.qty = makerLeftover.toString();
                 queue.unshift(maker);
                 break;
             }
         }
+
         if (queue.length === 0) {
-            delete updatedBook[oppositeSide][priceLevel.toString()];
+            delete updatedBook[oppositeSide][levelKey];
         }
     }
 
-    // For LIMIT orders, add leftover to own side; MARKET leftovers are discarded
-    if (order.type === 'LIMIT' && remaining > 0) {
+    // LIMIT leftovers go to own side; MARKET leftovers are discarded
+    if (order.type === 'LIMIT' && remaining.gt(0)) {
         const sideBook = updatedBook[ownSide];
-        const key = order.price.toString();
+        const key = order.price; // already a string
         if (!sideBook[key]) sideBook[key] = [];
         sideBook[key].push({
             orderId: order.orderId,
             side: order.side,
             type: order.type,
-            price: order.price,
-            qty: remaining,
+            price: order.price.toString(),
+            qty: remaining.toString(),
             userId: order.userId,
         });
     }
