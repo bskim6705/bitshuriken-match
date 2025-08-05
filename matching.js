@@ -22,13 +22,13 @@ import Decimal from 'decimal.js';
 
 /**
  * Trade represents a matched transaction between a maker and a taker.
- * filled: this trade leaves the order fully completed (post-trade state).
+ * remainingQty: this trade leaves the order fully completed (post-trade state).
  *
  * @typedef {Object} MakerTakerInfo
  * @property {string} orderId
  * @property {'BUY'|'SELL'} side
  * @property {string|number} [userId]
- * @property {boolean} [filled]
+ * @property {string} [remainingQty]
  *
  * @typedef {Object} TradeLike
  * @property {string} symbol
@@ -115,8 +115,7 @@ export function match(order, book) {
             const matchQty = Decimal.min(remaining, makerQtyDecimal);
 
             const makerLeftover = makerQtyDecimal.minus(matchQty);
-            const makerFilledAfter = makerLeftover.eq(0);
-            const takerFilledAfter = remaining.minus(matchQty).eq(0);
+            const takerLeftover = remaining.minus(matchQty);
 
             const trade = new Trade({
                 symbol: order.symbol,
@@ -124,13 +123,13 @@ export function match(order, book) {
                     orderId: maker.orderId,
                     side: maker.side,
                     userId: maker.userId,
-                    filled: makerFilledAfter,
+                    remainingQty: makerLeftover.toString(),
                 },
                 taker: {
                     orderId: order.orderId,
                     side: order.side,
                     userId: order.userId,
-                    filled: takerFilledAfter,
+                    remainingQty: takerLeftover.toString(),
                 },
                 price: levelKey,                // keep original string key (e.g., "114882.00")
                 qty: matchQty.toString(),
