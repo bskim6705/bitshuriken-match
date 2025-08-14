@@ -1,4 +1,25 @@
-// cancel.js
+// cancel.js (futures)
+import Decimal from 'decimal.js';
+
+class DeltaUserBalance {
+    /**
+     * @param {number} userId
+     * @param {Decimal} unlockBalance
+     * @param {Decimal} creditBalance
+     */
+    constructor(userId, currencyCode, {
+        unlockBalance = null,
+        creditBalance = null,
+        debitBalance = null,
+    }
+    ) {
+        this.userId = userId;
+        this.currencyCode = currencyCode;
+        this.unlockBalance = unlockBalance;
+        this.creditBalance = creditBalance;
+        this.debitBalance = debitBalance;
+    }
+}
 
 /**
  * Remove an existing order from the in-memory order book by orderId.
@@ -11,10 +32,12 @@
  * @param {OrderBook} book – current order book for the symbol
  * @returns {OrderBook} updatedBook – deep-cloned book without the cancelled order
  */
-export function cancel(orderId, book) {
-    console.log("recieved cancel", orderId, book);
+export function cancel(cp, bk) {
+    const cancelPayload = cp;
+    const book = bk;
     let cancelled = false;
     let removedOrder = null;
+    let deltaUserBalances = [];
 
     // Deep clone & filter bids
     const updatedBook = { bids: {}, asks: {} };
@@ -22,7 +45,7 @@ export function cancel(orderId, book) {
     for (const [price, orders] of Object.entries(book.bids)) {
         const remaining = [];
         for (const o of orders) {
-            if (o.orderId === orderId) {
+            if (o.orderId === cancelPayload.orderId) {
                 cancelled = true;
                 removedOrder = { ...o };
             } else {
@@ -38,7 +61,7 @@ export function cancel(orderId, book) {
     for (const [price, orders] of Object.entries(book.asks)) {
         const remaining = [];
         for (const o of orders) {
-            if (o.orderId === orderId) {
+            if (o.orderId === cancelPayload.orderId) {
                 cancelled = true;
                 removedOrder = { ...o };
             } else {
@@ -50,6 +73,17 @@ export function cancel(orderId, book) {
         }
     }
 
-    console.log("after cancel", updatedBook, cancelled, removedOrder);
-    return { updatedBook, cancelled, removedOrder };
-} 
+    if (removedOrder) {
+        deltaUserBalances.push(new DeltaUserBalance(
+            cancelPayload.userId,
+            removedOrder.side === 'SELL' ? cancelPayload.baseCurrencyCode : cancelPayload.quoteCurrencyCode,
+            {
+                unlockBalance: removedOrder.side === 'SELL' ? new Decimal(removedOrder.qty) : new Decimal(removedOrder.qty).mul(new Decimal(removedOrder.price)),
+            }
+        ));
+    }
+
+    return { updatedBook, cancelled, removedOrder, deltaUserBalances };
+}
+
+

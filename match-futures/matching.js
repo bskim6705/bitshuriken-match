@@ -1,24 +1,5 @@
-// matching.js
+// matching.js (futures)
 import Decimal from 'decimal.js';
-
-/**
- * Pure in-memory order matching implementation.
- * Uses price-time priority: price levels sorted, and FIFO per level.
- * Supports LIMIT and MARKET order types.
- *
- * @typedef {Object} Order
- * @property {string} orderId
- * @property {'BUY'|'SELL'} side
- * @property {'LIMIT'|'MARKET'} type
- * @property {string} price    // Only for LIMIT orders
- * @property {string} qty
- * @property {string|number} [userId]
- *
- * @typedef {Object<string, Order[]>} BookSide
- * @typedef {Object} OrderBook
- * @property {BookSide} bids  // price(string) -> list of buy orders
- * @property {BookSide} asks  // price(string) -> list of sell orders
- */
 
 /**
  * Trade represents a matched transaction between a maker and a taker.
@@ -56,20 +37,45 @@ class Trade {
     }
 }
 
+class DeltaUserBalance {
+    /**
+     * @param {number} userId
+     * @param {Decimal} unlockBalance
+     * @param {Decimal} creditBalance
+     */
+    constructor(userId, currencyCode, {
+        unlockBalance = null,
+        creditBalance = null,
+        debitBalance = null,
+    }
+    ) {
+        this.userId = userId;
+        this.currencyCode = currencyCode;
+        this.unlockBalance = unlockBalance;
+        this.creditBalance = creditBalance;
+        this.debitBalance = debitBalance;
+    }
+}
+
 // TPS counter initialized once per process
 let tradeCount = 0;
 setInterval(() => {
-    console.log(`TPS: ${tradeCount}`);
+    console.log(`FUTURES TPS: ${tradeCount}`);
     tradeCount = 0;
 }, 1000);
 
 /**
  * Match an incoming order against the in-memory order book.
- * @param {Order} order
+ * Mirrors spot logic for MVP.
+ * @param {OrderPayload} orderPayload
  * @param {OrderBook} book
- * @returns {{ trades: Trade[], updatedBook: OrderBook }}
+ * @returns {{ trades: Trade[], updatedBook: OrderBook, deltaUserBalances: DeltaUserBalance[] }}
  */
-export function match(order, book) {
+export function match(op, bk) {
+    const orderPayload = op;
+    const book = bk;
+    let deltaUserBalances = [];
+
     // Deep clone book (preserve string price keys)
     const updatedBook = { bids: {}, asks: {} };
     for (const [p, orders] of Object.entries(book.bids)) {
@@ -80,9 +86,9 @@ export function match(order, book) {
     }
 
     const trades = [];
-    const orderQtyDecimal = new Decimal(order.qty);
+    const orderQtyDecimal = new Decimal(orderPayload.qty);
     let remaining = orderQtyDecimal;
-    const isBuy = order.side === 'BUY';
+    const isBuy = orderPayload.side === 'BUY';
     const ownSide = isBuy ? 'bids' : 'asks';
     const oppositeSide = isBuy ? 'asks' : 'bids';
 
@@ -97,8 +103,8 @@ export function match(order, book) {
         const priceLevelDec = new Decimal(levelKey);
 
         // LIMIT price constraint with Decimal
-        if (order.type === 'LIMIT') {
-            const orderPriceDec = new Decimal(order.price);
+        if (orderPayload.type === 'LIMIT') {
+            const orderPriceDec = new Decimal(orderPayload.price);
             if (isBuy && orderPriceDec.lt(priceLevelDec)) break;
             if (!isBuy && orderPriceDec.gt(priceLevelDec)) break;
         }
@@ -114,11 +120,14 @@ export function match(order, book) {
             const makerQtyDecimal = new Decimal(maker.qty);
             const matchQty = Decimal.min(remaining, makerQtyDecimal);
 
+            const executedBase = matchQty;
+            const executedQuote = matchQty.mul(priceLevelDec);
+
             const makerLeftover = makerQtyDecimal.minus(matchQty);
             const takerLeftover = remaining.minus(matchQty);
 
             const trade = new Trade({
-                symbol: order.symbol,
+                symbol: orderPayload.symbol,
                 maker: {
                     orderId: maker.orderId,
                     side: maker.side,
@@ -126,16 +135,47 @@ export function match(order, book) {
                     remainingQty: makerLeftover.toString(),
                 },
                 taker: {
-                    orderId: order.orderId,
-                    side: order.side,
-                    userId: order.userId,
+                    orderId: orderPayload.orderId,
+                    side: orderPayload.side,
+                    userId: orderPayload.userId,
                     remainingQty: takerLeftover.toString(),
                 },
-                price: levelKey,                // keep original string key (e.g., "114882.00")
+                price: levelKey,
                 qty: matchQty.toString(),
                 timestamp: Date.now(),
             });
             trades.push(trade);
+
+            deltaUserBalances.push(new DeltaUserBalance(
+                maker.userId,
+                maker.side === 'SELL' ? orderPayload.baseCurrencyCode : orderPayload.quoteCurrencyCode,
+                {
+                    unlockBalance: maker.side === 'SELL' ? executedBase : executedQuote,
+                    debitBalance: maker.side === 'SELL' ? executedBase : executedQuote,
+                }
+            ));
+            deltaUserBalances.push(new DeltaUserBalance(
+                maker.userId,
+                maker.side === 'SELL' ? orderPayload.quoteCurrencyCode : orderPayload.baseCurrencyCode,
+                {
+                    creditBalance: maker.side === 'SELL' ? executedQuote : executedBase,
+                }
+            ));
+            deltaUserBalances.push(new DeltaUserBalance(
+                orderPayload.userId,
+                orderPayload.side === 'SELL' ? orderPayload.baseCurrencyCode : orderPayload.quoteCurrencyCode,
+                {
+                    unlockBalance: orderPayload.side === 'SELL' ? executedBase : matchQty.mul(orderPayload.price),
+                    debitBalance: orderPayload.side === 'SELL' ? executedBase : executedQuote,
+                }
+            ));
+            deltaUserBalances.push(new DeltaUserBalance(
+                orderPayload.userId,
+                orderPayload.side === 'SELL' ? orderPayload.quoteCurrencyCode : orderPayload.baseCurrencyCode,
+                {
+                    creditBalance: orderPayload.side === 'SELL' ? executedQuote : executedBase,
+                }
+            ));
 
             remaining = remaining.minus(matchQty);
 
@@ -152,20 +192,30 @@ export function match(order, book) {
     }
 
     // LIMIT leftovers go to own side; MARKET leftovers are discarded
-    if (order.type === 'LIMIT' && remaining.gt(0)) {
+    if (orderPayload.type === 'LIMIT' && remaining.gt(0)) {
         const sideBook = updatedBook[ownSide];
-        const key = order.price; // already a string
+        const key = orderPayload.price; // already a string
         if (!sideBook[key]) sideBook[key] = [];
         sideBook[key].push({
-            orderId: order.orderId,
-            side: order.side,
-            type: order.type,
-            price: order.price.toString(),
+            orderId: orderPayload.orderId,
+            side: orderPayload.side,
+            type: orderPayload.type,
+            price: orderPayload.price.toString(),
             qty: remaining.toString(),
-            userId: order.userId,
+            userId: orderPayload.userId,
         });
+    } else if (orderPayload.type === 'MARKET' && remaining.gt(0)) {
+        deltaUserBalances.push(new DeltaUserBalance(
+            orderPayload.userId,
+            orderPayload.side === 'SELL' ? orderPayload.baseCurrencyCode : orderPayload.quoteCurrencyCode,
+            {
+                unlockBalance: orderPayload.side === 'SELL' ? remaining : remaining.mul(new Decimal(orderPayload.price)),
+            }
+        ));
     }
 
     tradeCount += trades.length;
-    return { trades, updatedBook };
+    return { trades, updatedBook, deltaUserBalances };
 }
+
+
